@@ -963,6 +963,70 @@ impl PyVindex {
         Ok(result.predictions)
     }
 
+    /// Per-fact target-delta optimisation (MEMIT phase 3).
+    ///
+    /// Returns (delta_array, baseline_loss, final_loss). Currently only
+    /// install_layer = n_layers-1 is supported; mid-layer backward
+    /// through attention+FFN is pending.
+    #[pyo3(signature = (prompt, target, install_layer, steps=60, lr=0.5, kl_weight=0.0625))]
+    fn optimise_target_delta<'py>(
+        &self,
+        py: Python<'py>,
+        prompt: &str,
+        target: &str,
+        install_layer: usize,
+        steps: usize,
+        lr: f32,
+        kl_weight: f32,
+    ) -> PyResult<(Bound<'py, PyArray1<f32>>, f32, f32)> {
+        {
+            let mut state = self.walk_model.borrow_mut();
+            if state.is_none() {
+                let dir = std::path::Path::new(&self.path);
+                *state = Some(
+                    crate::walk::InferState::load(dir).map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to load model weights: {e}"
+                        ))
+                    })?,
+                );
+            }
+        }
+        let state = self.walk_model.borrow();
+        let infer_state = state.as_ref().unwrap();
+
+        let prompt_enc = self
+            .tokenizer
+            .encode(prompt, true)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let prompt_ids: Vec<u32> = prompt_enc.get_ids().to_vec();
+        let target_spaced = format!(" {target}");
+        let target_enc = self
+            .tokenizer
+            .encode(target_spaced.as_str(), false)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let target_id: u32 = target_enc.get_ids().first().copied().unwrap_or(0);
+
+        let opts = larql_inference::TargetDeltaOpts {
+            steps,
+            lr,
+            kl_weight,
+            normalise: false,
+        };
+        let result = larql_inference::forward::target_delta::optimise_target_delta(
+            &infer_state.weights,
+            &prompt_ids,
+            target_id,
+            install_layer,
+            opts,
+        )
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+
+        let delta_vec = result.delta.to_vec();
+        let delta_np = numpy::PyArray1::from_vec(py, delta_vec);
+        Ok((delta_np, result.baseline_loss, result.final_loss))
+    }
+
     /// Run inference and capture per-layer residuals (last token position).
     ///
     /// Returns (predictions, residuals) where:
